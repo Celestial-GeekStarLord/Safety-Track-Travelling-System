@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1056876232559",
+    "project_id": "safestride-40f5f",
+    "storage_bucket": "safestride-40f5f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1056876232559:android:38ab4af356d8d225ef329a",
+        "android_client_info": {
+          "package_name": "com.example.safestride"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCeiF4e-bE3I75R-Ni9jpt2elB_mvelJew"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

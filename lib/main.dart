@@ -387,6 +387,7 @@ class SSScaffold extends StatelessWidget {
   final bool showBack;
   final List<Widget> children;
   final Widget? bottom;
+  final VoidCallback? onBack; // overrides the default Navigator pop
 
   const SSScaffold({
     super.key,
@@ -395,6 +396,7 @@ class SSScaffold extends StatelessWidget {
     this.showBack = true,
     required this.children,
     this.bottom,
+    this.onBack,
   });
 
   @override
@@ -410,7 +412,7 @@ class SSScaffold extends StatelessWidget {
                   if (showBack)
                     IconButton(
                       visualDensity: VisualDensity.compact,
-                      onPressed: () => Navigator.maybePop(context),
+                      onPressed: onBack ?? () => Navigator.maybePop(context),
                       icon: const Icon(Icons.arrow_back, color: SS.teal),
                     )
                   else
@@ -638,6 +640,7 @@ class MiniMap extends StatelessWidget {
   final bool showRoute;
   final String initials;
   final bool markerFaded;
+  final double zoneRadius; // drawn circle radius in logical pixels
   const MiniMap({
     super.key,
     this.height = 190,
@@ -645,6 +648,7 @@ class MiniMap extends StatelessWidget {
     this.showRoute = false,
     this.initials = 'JL',
     this.markerFaded = false,
+    this.zoneRadius = 52,
   });
 
   @override
@@ -654,7 +658,7 @@ class MiniMap extends StatelessWidget {
       height: height,
       width: double.infinity,
       child: CustomPaint(
-        painter: _MapPainter(showZone, showRoute),
+        painter: _MapPainter(showZone, showRoute, zoneRadius),
         child: Align(
           alignment: showRoute ? const Alignment(.35, .55) : Alignment.center,
           child: Container(
@@ -684,7 +688,8 @@ class MiniMap extends StatelessWidget {
 class _MapPainter extends CustomPainter {
   final bool zone;
   final bool route;
-  _MapPainter(this.zone, this.route);
+  final double radius;
+  _MapPainter(this.zone, this.route, this.radius);
 
   @override
   void paint(Canvas c, Size s) {
@@ -736,14 +741,14 @@ class _MapPainter extends CustomPainter {
 
     if (zone) {
       final center = Offset(s.width / 2, s.height / 2);
-      c.drawCircle(center, 52, Paint()..color = SS.teal.withAlpha(25));
+      c.drawCircle(center, radius, Paint()..color = SS.teal.withAlpha(25));
       final dash = Paint()
         ..color = SS.teal
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.4;
       for (var a = 0.0; a < 2 * pi; a += .22) {
         c.drawArc(
-          Rect.fromCircle(center: center, radius: 52),
+          Rect.fromCircle(center: center, radius: radius),
           a,
           .12,
           false,
@@ -767,7 +772,7 @@ class _MapPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _MapPainter old) =>
-      old.zone != zone || old.route != route;
+      old.zone != zone || old.route != route || old.radius != radius;
 }
 
 /// Bottom navigation used by both Traveler and Guardian shells.
