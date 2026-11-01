@@ -23,6 +23,10 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import 'guardian_screens.dart';
+import 'services.dart';
+import 'traveller_screens.dart';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BOOTSTRAP
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,6 +42,7 @@ Future<void> main() async {
   } catch (e) {
     debugPrint('Firebase not configured, running in demo mode: $e');
   }
+  await OfflineStore.init(); // Hive outbox for offline tracking (step 2)
   SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.dark);
   runApp(
     ChangeNotifierProvider(
@@ -73,12 +78,11 @@ class SS {
       scaffoldBackgroundColor: bg,
     );
     return base.copyWith(
-      textTheme: GoogleFonts.nunitoTextTheme(
-        base.textTheme,
-      ).apply(bodyColor: ink, displayColor: ink),
+      // Explicit styles (ssBody, ssHeadline...) use Nunito via GoogleFonts.nunito().
+      // We keep the theme-wide TextTheme free of google_fonts types to stay compatible
+      // with any google_fonts / Flutter SDK combination.
+      textTheme: base.textTheme.apply(bodyColor: ink, displayColor: ink),
       appBarTheme: const AppBarTheme(backgroundColor: bg, elevation: 0),
-      // Keep your existing switchTheme and other properties.
-
       switchTheme: SwitchThemeData(
         thumbColor: WidgetStateProperty.all(Colors.white),
         trackColor: WidgetStateProperty.resolveWith(
@@ -144,6 +148,57 @@ class AppState extends ChangeNotifier {
   void setShareLocation(bool v) {
     shareLocation = v;
     notifyListeners();
+    if (paired && backendReady && !sharingPaused) {
+      v ? _startTracking() : TrackingService.instance.stop();
+    }
+  }
+
+  Future<void> _startTracking() => TrackingService.instance.start(
+    travelerUid: Repo.instance.uid!,
+    travelerName: displayName,
+  );
+
+  // Pause / resume sharing (Traveler > Sharing tab)
+  bool sharingPaused = false;
+  DateTime? pausedUntil;
+  Timer? _resumeTimer;
+
+  Future<void> setPaused(bool paused, {Duration? forDuration}) async {
+    sharingPaused = paused;
+    _resumeTimer?.cancel();
+    pausedUntil = null;
+    if (paused && forDuration != null) {
+      pausedUntil = DateTime.now().add(forDuration);
+      _resumeTimer = Timer(forDuration, () => setPaused(false));
+    }
+    notifyListeners();
+    if (!backendReady) {
+      return;
+    }
+    final pairs = await Repo.instance.watchPairsAsTraveler().first;
+    for (final p in pairs) {
+      await Repo.instance.setSharingPaused(p.id, paused);
+    }
+    if (paused) {
+      await TrackingService.instance.stop();
+    } else if (shareLocation) {
+      await _startTracking();
+    }
+  }
+
+  /// Remove every Guardian connection and stop tracking.
+  Future<void> endConnection() async {
+    _resumeTimer?.cancel();
+    if (backendReady) {
+      final pairs = await Repo.instance.watchPairsAsTraveler().first;
+      for (final p in pairs) {
+        await Repo.instance.endPairing(p.id);
+      }
+      await TrackingService.instance.stop();
+    }
+    paired = false;
+    sharingPaused = false;
+    notifyListeners();
   }
 
   void setShareDevice(bool v) {
@@ -179,6 +234,12 @@ class AppState extends ChangeNotifier {
         return e.message ?? 'Could not sign in. Please try again.';
       }
     }
+    if (firebaseReady) {
+      await Repo.instance.saveProfile(name: displayName, role: role.name);
+      if (role == UserRole.guardian) {
+        Repo.instance.registerPushToken();
+      }
+    }
     signedIn = true;
     notifyListeners();
     return null;
@@ -189,29 +250,73 @@ class AppState extends ChangeNotifier {
   void generateCode() {
     syncCode = (100000 + Random.secure().nextInt(900000)).toString();
     codeExpiry = DateTime.now().add(const Duration(minutes: 10));
+    if (backendReady) {
+      Repo.instance.createPairingCode(syncCode, displayName, codeExpiry!);
+    }
     _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (remaining == Duration.zero) _ticker?.cancel();
+      if (remaining == Duration.zero) {
+        _ticker?.cancel();
+      }
       notifyListeners();
     });
     notifyListeners();
   }
 
   Duration get remaining {
-    if (codeExpiry == null) return Duration.zero;
+    if (codeExpiry == null) {
+      return Duration.zero;
+    }
     final d = codeExpiry!.difference(DateTime.now());
     return d.isNegative ? Duration.zero : d;
   }
 
-  /// Traveler: look up a code. STEP 2: query Firestore `pairingCodes/{code}`.
-  Future<String?> lookupGuardian(String code) async {
-    await Future.delayed(const Duration(milliseconds: 400));
-    if (code.length != 6) return null;
-    return guardianName; // demo: any 6 digits resolves to Maya Lee
+  String get displayName {
+    final base = email.split('@').first;
+    if (base.isEmpty) {
+      return role == UserRole.guardian ? 'Guardian' : 'Traveler';
+    }
+    return base
+        .split(RegExp(r'[._-]'))
+        .where((w) => w.isNotEmpty)
+        .map((w) => w[0].toUpperCase() + w.substring(1))
+        .join(' ');
   }
 
-  /// Traveler confirms. STEP 2: create `pairs/{id}` linking traveler & guardian.
+  String _pendingCode = '';
+
+  /// Traveler: look up a code in Firestore (demo mode: any 6 digits resolves).
+  Future<String?> lookupGuardian(String code) async {
+    if (code.length != 6) {
+      return null;
+    }
+    _pendingCode = code;
+    if (!backendReady) {
+      await Future.delayed(const Duration(milliseconds: 400));
+      return guardianName;
+    }
+    final name = await Repo.instance.lookupCode(code);
+    if (name != null) {
+      guardianName = name;
+    }
+    return name;
+  }
+
+  /// Traveler confirms: create the pair, save profile, start background tracking.
   Future<void> confirmPairing() async {
+    if (backendReady) {
+      await Repo.instance.saveProfile(name: displayName, role: 'traveler');
+      await Repo.instance.confirmPairing(
+        _pendingCode,
+        travelerName: displayName,
+      );
+      if (shareLocation) {
+        await TrackingService.instance.start(
+          travelerUid: Repo.instance.uid!,
+          travelerName: displayName,
+        );
+      }
+    }
     paired = true;
     notifyListeners();
   }
@@ -244,9 +349,8 @@ class SafeStrideApp extends StatelessWidget {
         '/invite': (_) => const GuardianInviteScreen(),
         '/pair': (_) => const TravelerPairScreen(),
         // STEP 3/4 replace these with real shells:
-        '/traveler': (_) => const ShellPlaceholder(label: 'Traveler home'),
-        '/guardian': (_) =>
-            const ShellPlaceholder(label: 'Guardian people overview'),
+        '/traveler': (_) => const TravelerShell(),
+        '/guardian': (_) => const GuardianShell(),
       },
     );
   }
@@ -666,6 +770,69 @@ class _MapPainter extends CustomPainter {
       old.zone != zone || old.route != route;
 }
 
+/// Bottom navigation used by both Traveler and Guardian shells.
+class SSBottomNav extends StatelessWidget {
+  final List<(IconData, String)> items;
+  final int index;
+  final ValueChanged<int> onTap;
+  const SSBottomNav({
+    super.key,
+    required this.items,
+    required this.index,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) => Container(
+    decoration: const BoxDecoration(
+      color: SS.bg,
+      border: Border(top: BorderSide(color: SS.line)),
+    ),
+    padding: const EdgeInsets.fromLTRB(8, 8, 8, 6),
+    child: Row(
+      children: [
+        for (var i = 0; i < items.length; i++)
+          Expanded(
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: () => onTap(i),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 160),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: i == index ? SS.mint : Colors.transparent,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Icon(
+                      items[i].$1,
+                      size: 20,
+                      color: i == index ? SS.teal : SS.muted,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    items[i].$2,
+                    style: ssBody(
+                      bold: i == index,
+                      size: 11,
+                      color: i == index ? SS.teal : SS.muted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
 void ssToast(BuildContext c, String msg) =>
     ScaffoldMessenger.of(c).showSnackBar(
       SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
@@ -827,7 +994,9 @@ class _SignInScreenState extends State<SignInScreen> {
     });
     final state = context.read<AppState>();
     final err = await state.signIn(_email.text, _pass.text, create: _create);
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
     setState(() {
       _busy = false;
       _error = err;
@@ -889,7 +1058,9 @@ class _SignInScreenState extends State<SignInScreen> {
                 await FirebaseAuth.instance.sendPasswordResetEmail(
                   email: _email.text.trim(),
                 );
-                if (mounted) ssToast(context, 'Reset link sent.');
+                if (mounted) {
+                  ssToast(context, 'Reset link sent.');
+                }
               } else {
                 ssToast(context, 'Enter your email first.');
               }
@@ -1176,7 +1347,9 @@ class _GuardianInviteScreenState extends State<GuardianInviteScreen> {
       c.length == 6 ? '${c.substring(0, 3)} ${c.substring(3)}' : c;
 
   String _fmtExpiry(DateTime? d) {
-    if (d == null) return '';
+    if (d == null) {
+      return '';
+    }
     final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
     final m = d.minute.toString().padLeft(2, '0');
     return '$h:$m ${d.hour >= 12 ? 'PM' : 'AM'}';
@@ -1259,7 +1432,7 @@ class _GuardianInviteScreenState extends State<GuardianInviteScreen> {
                     'Join my SafeStride circle. Enter code ${_fmtCode(s.syncCode)} in the app. It expires in 10 minutes.',
               ),
             );
-            if (context.mounted) {
+            if (mounted) {
               ssToast(
                 context,
                 'Invitation copied. Add share_plus for the share sheet.',
@@ -1457,7 +1630,7 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
             onPressed: () async {
               final s = context.read<AppState>();
               await s.confirmPairing();
-              if (context.mounted) {
+              if (mounted) {
                 Navigator.pushNamedAndRemoveUntil(
                   context,
                   '/traveler',
