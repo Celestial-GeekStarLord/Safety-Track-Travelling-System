@@ -18,6 +18,7 @@ import 'package:flutter_map/flutter_map.dart' show MapController;
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'main.dart';
 import 'maps.dart';
@@ -42,6 +43,7 @@ class GD {
       travelerUid: 'jamie',
       travelerName: 'Jamie Lee',
       relation: 'Your child',
+      travelerPhone: '+977 980 000 0000',
     ),
     PairInfo(
       id: 'p2',
@@ -1176,7 +1178,11 @@ class TravelerDetail extends StatelessWidget {
                   child: SSButton(
                     'Call $name',
                     icon: Icons.call_outlined,
-                    onPressed: () => _soon(context, 'Calling'),
+                    onPressed: () => callTraveler(
+                      context,
+                      pair.travelerName,
+                      pair.travelerPhone,
+                    ),
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -1185,7 +1191,12 @@ class TravelerDetail extends StatelessWidget {
                     'Directions',
                     icon: Icons.navigation_outlined,
                     filled: false,
-                    onPressed: () => _soon(context, 'Directions'),
+                    onPressed: () => openDirections(
+                      context,
+                      pair.travelerName,
+                      p?.lat,
+                      p?.lng,
+                    ),
                   ),
                 ),
               ],
@@ -1205,10 +1216,71 @@ class TravelerDetail extends StatelessWidget {
   }
 }
 
-void _soon(BuildContext c, String what) => ssToast(
-  c,
-  '$what needs the url_launcher package and the Traveler\'s phone number. Add them when you are ready.',
-);
+/// Opens the phone app with the Traveler's number (or explains how to get one).
+Future<void> callTraveler(
+  BuildContext context,
+  String name,
+  String phone,
+) async {
+  final first = _first(name);
+  if (phone.trim().isEmpty) {
+    await showDialog<void>(
+      context: context,
+      builder: (d) => AlertDialog(
+        backgroundColor: SS.bg,
+        title: Text('No phone number yet', style: ssBody(bold: true, size: 18)),
+        content: Text(
+          '$first has not shared a phone number. Ask them to add one in SafeStride under Sharing → Phone number.',
+          style: ssSub(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(d),
+            child: Text('OK', style: ssBody(bold: true, color: SS.teal)),
+          ),
+        ],
+      ),
+    );
+    return;
+  }
+  var ok = false;
+  try {
+    ok = await launchUrl(Uri(scheme: 'tel', path: phone.replaceAll(' ', '')));
+  } catch (_) {}
+  if (!ok && context.mounted) {
+    ssToast(context, "Couldn't open the phone app.");
+  }
+}
+
+/// Opens walking directions to a coordinate in the user's maps app.
+Future<void> openDirections(
+  BuildContext context,
+  String name,
+  double? lat,
+  double? lng,
+) async {
+  if (lat == null || lng == null || (lat == 0 && lng == 0)) {
+    ssToast(
+      context,
+      GD.demo
+          ? 'Demo mode has no real location.'
+          : 'No location yet for ${_first(name)}.',
+    );
+    return;
+  }
+  var ok = false;
+  try {
+    ok = await launchUrl(
+      Uri.parse(
+        'https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=walking',
+      ),
+      mode: LaunchMode.externalApplication,
+    );
+  } catch (_) {}
+  if (!ok && context.mounted) {
+    ssToast(context, "Couldn't open a maps app.");
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. SAFE ZONES
@@ -2137,25 +2209,37 @@ class AlertDetail extends StatelessWidget {
             ],
           ),
         ),
-        Row(
-          children: [
-            Expanded(
-              child: SSButton(
-                'Call $name',
-                icon: Icons.call_outlined,
-                onPressed: () => _soon(context, 'Calling'),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: SSButton(
-                'Directions',
-                icon: Icons.navigation_outlined,
-                filled: false,
-                onPressed: () => _soon(context, 'Directions'),
-              ),
-            ),
-          ],
+        Src<List<PairInfo>>(
+          create: GD.pairs,
+          initial: GD.pairsInit,
+          builder: (c, prs) {
+            final match = prs
+                .where((x) => x.travelerUid == a.travelerUid)
+                .toList();
+            final phone = match.isEmpty ? '' : match.first.travelerPhone;
+            return Row(
+              children: [
+                Expanded(
+                  child: SSButton(
+                    'Call $name',
+                    icon: Icons.call_outlined,
+                    onPressed: () =>
+                        callTraveler(context, a.travelerName, phone),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SSButton(
+                    'Directions',
+                    icon: Icons.navigation_outlined,
+                    filled: false,
+                    onPressed: () =>
+                        openDirections(context, a.travelerName, a.lat, a.lng),
+                  ),
+                ),
+              ],
+            );
+          },
         ),
         const SizedBox(height: 10),
         SSButton(

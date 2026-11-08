@@ -535,6 +535,48 @@ class SharingScreen extends StatelessWidget {
     );
   }
 
+  Future<void> _phoneDialog(BuildContext context, AppState app) async {
+    final ctl = TextEditingController(text: app.phone);
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: SS.bg,
+        title: Text('Phone number', style: ssBody(bold: true, size: 18)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Only ${_first(app.guardianName)} can see this, so they can call you.',
+              style: ssSub(),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctl,
+              keyboardType: TextInputType.phone,
+              autofocus: true,
+              decoration: const InputDecoration(hintText: '+977 98…'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: Text('Cancel', style: ssBody(bold: true, color: SS.muted)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, ctl.text.trim()),
+            child: Text('Save', style: ssBody(bold: true, color: SS.teal)),
+          ),
+        ],
+      ),
+    );
+    ctl.dispose();
+    if (saved != null) {
+      await app.setPhone(saved);
+    }
+  }
+
   Future<void> _endSheet(BuildContext context, AppState app) async {
     final nav = Navigator.of(context);
     final ok = await showDialog<bool>(
@@ -650,6 +692,33 @@ class SharingScreen extends StatelessWidget {
                 'Battery, connection and GPS readiness.',
                 app.shareDeviceStatus,
                 app.setShareDevice,
+              ),
+            ],
+          ),
+        ),
+        SSCard(
+          onTap: () => _phoneDialog(context, app),
+          child: Row(
+            children: [
+              _tile(Icons.call_outlined),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Phone number', style: ssBody(bold: true, size: 14.5)),
+                    Text(
+                      app.phone.isEmpty
+                          ? 'Add a number so ${_first(g)} can call you'
+                          : app.phone,
+                      style: ssBody(size: 12, color: SS.muted),
+                    ),
+                  ],
+                ),
+              ),
+              Text(
+                app.phone.isEmpty ? 'Add' : 'Edit',
+                style: ssBody(bold: true, size: 13, color: SS.teal),
               ),
             ],
           ),

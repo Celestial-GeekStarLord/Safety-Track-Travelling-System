@@ -17,11 +17,14 @@ import 'dart:math';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'guardian_screens.dart';
 import 'services.dart';
@@ -127,6 +130,7 @@ class AppState extends ChangeNotifier {
   UserRole role = UserRole.traveler;
   String email = '';
   String name = ''; // full name chosen at sign-up
+  String phone = ''; // Traveler's number, shared only with their Guardians
   bool signedIn = false;
 
   // Traveler consent
@@ -156,6 +160,50 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<void> setPhone(String v) async {
+    phone = v.trim();
+    await OfflineStore.setStr('phone', phone);
+    notifyListeners();
+    if (paired && backendReady) {
+      await Repo.instance.updateTravelerPhone(phone);
+    }
+  }
+
+  /// Google sign-in through Firebase's own provider flow (no extra package needed).
+  /// Returns null on success, '' if the user cancelled, otherwise an error message.
+  Future<String?> signInWithGoogle() async {
+    if (!firebaseReady) {
+      return 'Google sign-in needs Firebase to be connected.';
+    }
+    try {
+      final cred = await FirebaseAuth.instance.signInWithProvider(
+        GoogleAuthProvider(),
+      );
+      email = cred.user?.email ?? '';
+      name = cred.user?.displayName ?? '';
+      await Repo.instance.saveProfile(
+        name: displayName,
+        role: role.name,
+        overwriteRole: false,
+      );
+      if (role == UserRole.guardian) {
+        Repo.instance.registerPushToken();
+      }
+      signedIn = true;
+      notifyListeners();
+      return null;
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'canceled' ||
+          e.code == 'web-context-canceled' ||
+          e.code == 'web-context-cancelled') {
+        return '';
+      }
+      return e.message ?? 'Google sign-in failed.';
+    } catch (e) {
+      return 'Google sign-in failed. $e';
+    }
+  }
+
   /// Starts background tracking. Returns false (and sets TrackingService.problem) on failure.
   Future<bool> startTracking() {
     final uid = Repo.instance.uid;
@@ -175,6 +223,7 @@ class AppState extends ChangeNotifier {
     sharingPaused = p.sharingPaused;
     shareLocation = OfflineStore.flag('shareLocation');
     shareDeviceStatus = OfflineStore.flag('shareDevice');
+    phone = OfflineStore.str('phone');
     notifyListeners();
     if (shareLocation && !sharingPaused) {
       await startTracking();
@@ -197,6 +246,7 @@ class AppState extends ChangeNotifier {
     await OfflineStore.clearAll();
     email = '';
     name = '';
+    phone = '';
     signedIn = false;
     paired = false;
     sharingPaused = false;
@@ -294,7 +344,11 @@ class AppState extends ChangeNotifier {
       }
     }
     if (firebaseReady) {
-      await Repo.instance.saveProfile(name: displayName, role: role.name);
+      await Repo.instance.saveProfile(
+        name: displayName,
+        role: role.name,
+        overwriteRole: create,
+      );
       if (role == UserRole.guardian) {
         Repo.instance.registerPushToken();
       }
@@ -377,6 +431,7 @@ class AppState extends ChangeNotifier {
       await Repo.instance.confirmPairing(
         _pendingCode,
         travelerName: displayName,
+        travelerPhone: phone,
       );
       if (shareLocation) {
         await startTracking();
@@ -1100,6 +1155,37 @@ class _SignInScreenState extends State<SignInScreen> {
     super.dispose();
   }
 
+  /// With Firebase: let SessionGate decide (existing users skip onboarding).
+  void _afterSignIn(AppState state) {
+    if (backendReady) {
+      Navigator.pushNamedAndRemoveUntil(context, '/', (r) => false);
+    } else {
+      Navigator.pushNamed(
+        context,
+        state.role == UserRole.traveler ? '/consent' : '/invite',
+      );
+    }
+  }
+
+  Future<void> _google() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final state = context.read<AppState>();
+    final err = await state.signInWithGoogle();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _error = (err == null || err.isEmpty) ? null : err;
+    });
+    if (err == null) {
+      _afterSignIn(state);
+    }
+  }
+
   Future<void> _submit() async {
     setState(() {
       _busy = true;
@@ -1127,10 +1213,7 @@ class _SignInScreenState extends State<SignInScreen> {
       _error = err;
     });
     if (err == null) {
-      Navigator.pushNamed(
-        context,
-        state.role == UserRole.traveler ? '/consent' : '/invite',
-      );
+      _afterSignIn(state);
     }
   }
 
@@ -1225,22 +1308,23 @@ class _SignInScreenState extends State<SignInScreen> {
           ),
         ),
         const SizedBox(height: 12),
-        SSButton(
-          'Continue with Apple',
-          icon: Icons.apple,
-          filled: false,
-          onPressed: () => ssToast(
-            context,
-            'Apple sign-in: add sign_in_with_apple in step 2.',
+        if (defaultTargetPlatform == TargetPlatform.iOS) ...[
+          SSButton(
+            'Continue with Apple',
+            icon: Icons.apple,
+            filled: false,
+            onPressed: () => ssToast(
+              context,
+              'Apple sign-in needs an Apple Developer account. It arrives with the iOS build.',
+            ),
           ),
-        ),
-        const SizedBox(height: 10),
+          const SizedBox(height: 10),
+        ],
         SSButton(
           'Continue with Google',
           icon: Icons.language,
           filled: false,
-          onPressed: () =>
-              ssToast(context, 'Google sign-in: add google_sign_in in step 2.'),
+          onPressed: _busy ? null : _google,
         ),
         const SizedBox(height: 14),
         const SSInfo(
@@ -1608,18 +1692,14 @@ class _GuardianInviteScreenState extends State<GuardianInviteScreen> {
           'Share invitation',
           icon: Icons.share_outlined,
           onPressed: () async {
-            await Clipboard.setData(
-              ClipboardData(
+            final code = _fmtCode(s.syncCode);
+            await SharePlus.instance.share(
+              ShareParams(
+                subject: 'Join my SafeStride circle',
                 text:
-                    'Join my SafeStride circle. Enter code ${_fmtCode(s.syncCode)} in the app. It expires in 10 minutes.',
+                    'Join my SafeStride circle. Open SafeStride, choose "I\'m a Traveler", then enter the code $code. It expires in 10 minutes.',
               ),
             );
-            if (mounted) {
-              ssToast(
-                context,
-                'Invitation copied. Add share_plus for the share sheet.',
-              );
-            }
           },
         ),
         const SizedBox(height: 10),
@@ -1678,13 +1758,27 @@ class TravelerPairScreen extends StatefulWidget {
 class _TravelerPairScreenState extends State<TravelerPairScreen> {
   final _ctrl = TextEditingController();
   final _focus = FocusNode();
+  final _phone = TextEditingController();
   String? _guardian; // set when a valid code resolves
 
   @override
   void dispose() {
     _ctrl.dispose();
+    _phone.dispose();
     _focus.dispose();
     super.dispose();
+  }
+
+  Future<void> _scan() async {
+    final code = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => const QrScanScreen()),
+    );
+    if (code == null || !mounted) {
+      return;
+    }
+    _ctrl.text = code;
+    await _onChanged(code);
   }
 
   Future<void> _onChanged(String v) async {
@@ -1762,8 +1856,7 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
           'Scan a QR code instead',
           icon: Icons.qr_code_scanner,
           filled: false,
-          onPressed: () =>
-              ssToast(context, 'QR scanning: add mobile_scanner in step 2.'),
+          onPressed: _scan,
         ),
         const SizedBox(height: 12),
         if (_guardian != null) ...[
@@ -1806,11 +1899,46 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
               ],
             ),
           ),
+          Text(
+            'Your phone number (optional)',
+            style: ssBody(bold: true, size: 12.5),
+          ),
+          const SizedBox(height: 6),
+          TextField(
+            controller: _phone,
+            keyboardType: TextInputType.phone,
+            style: ssBody(size: 15),
+            decoration: InputDecoration(
+              hintText: '+977 98…',
+              helperText:
+                  'So ${_guardian!.split(' ').first} can call you. Only your Guardian sees it.',
+              filled: true,
+              fillColor: Colors.white,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 14,
+                vertical: 14,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: SS.line),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: SS.line),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: SS.teal, width: 1.6),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
           SSButton(
             'Confirm & share with ${_guardian!.split(' ').first}',
             icon: Icons.shield_outlined,
             onPressed: () async {
               final s = context.read<AppState>();
+              await s.setPhone(_phone.text);
               await s.confirmPairing();
               if (mounted) {
                 Navigator.pushNamedAndRemoveUntil(

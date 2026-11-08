@@ -306,6 +306,7 @@ class PairInfo {
       travelerName,
       relation;
   final bool sharingPaused;
+  final String travelerPhone; // shared with the Guardian so they can call
   PairInfo({
     required this.id,
     required this.guardianUid,
@@ -314,6 +315,7 @@ class PairInfo {
     required this.travelerName,
     this.relation = '',
     this.sharingPaused = false,
+    this.travelerPhone = '',
   });
   factory PairInfo.fromMap(String id, Map<String, dynamic> m) => PairInfo(
     id: id,
@@ -323,6 +325,7 @@ class PairInfo {
     travelerName: (m['travelerName'] as String?) ?? 'Traveler',
     relation: (m['relation'] as String?) ?? '',
     sharingPaused: (m['sharingPaused'] as bool?) ?? false,
+    travelerPhone: (m['travelerPhone'] as String?) ?? '',
   );
 }
 
@@ -400,6 +403,20 @@ class OfflineStore {
   static Future<void> setFlag(String key, bool v) async {
     try {
       await _meta.put('flag_$key', v ? '1' : '0');
+    } catch (_) {}
+  }
+
+  static String str(String key) {
+    try {
+      return _meta.get('str_$key') ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<void> setStr(String key, String v) async {
+    try {
+      await _meta.put('str_$key', v);
     } catch (_) {}
   }
 
@@ -707,16 +724,31 @@ class Repo {
   String? get uid => FirebaseAuth.instance.currentUser?.uid;
 
   // ── users + push
-  Future<void> saveProfile({required String name, required String role}) async {
+  /// [overwriteRole] false keeps an existing role (used when an existing user signs in, so
+  /// "Already connected? Sign in" can never flip a Guardian into a Traveler).
+  Future<void> saveProfile({
+    required String name,
+    required String role,
+    bool overwriteRole = true,
+  }) async {
     final u = uid;
     if (u == null) {
       return;
     }
-    await _db.collection('users').doc(u).set({
+    final ref = _db.collection('users').doc(u);
+    final data = <String, dynamic>{
       'name': name,
-      'role': role,
       'email': FirebaseAuth.instance.currentUser?.email,
-    }, SetOptions(merge: true));
+    };
+    if (overwriteRole) {
+      data['role'] = role;
+    } else {
+      final snap = await ref.get();
+      if (snap.data()?['role'] == null) {
+        data['role'] = role;
+      }
+    }
+    await ref.set(data, SetOptions(merge: true));
   }
 
   /// Stores the FCM token so a Cloud Function can push alerts to this Guardian.
@@ -769,6 +801,7 @@ class Repo {
   Future<void> confirmPairing(
     String code, {
     required String travelerName,
+    String travelerPhone = '',
   }) async {
     final ref = _db.collection('pairingCodes').doc(code);
     await _db.runTransaction((tx) async {
@@ -786,6 +819,7 @@ class Repo {
         'guardianName': d['guardianName'],
         'travelerUid': uid,
         'travelerName': travelerName,
+        'travelerPhone': travelerPhone,
         'members': [d['guardianUid'], uid],
         'sharingPaused': false,
         'createdAt': DateTime.now().millisecondsSinceEpoch,
@@ -796,6 +830,21 @@ class Repo {
       }, SetOptions(merge: true));
       tx.update(ref, {'used': true});
     });
+  }
+
+  /// Traveler updates the number their Guardians can call.
+  Future<void> updateTravelerPhone(String phone) async {
+    final u = uid;
+    if (u == null) {
+      return;
+    }
+    final snap = await _db
+        .collection('pairs')
+        .where('travelerUid', isEqualTo: u)
+        .get();
+    for (final d in snap.docs) {
+      await d.reference.update({'travelerPhone': phone});
+    }
   }
 
   Future<void> setSharingPaused(String pairId, bool paused) =>

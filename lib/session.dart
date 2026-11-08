@@ -11,6 +11,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
@@ -55,6 +56,10 @@ class _SessionGateState extends State<SessionGate> {
       if (role == 'guardian') {
         app.role = UserRole.guardian;
         Repo.instance.registerPushToken(); // keeps the FCM token fresh
+        final mine = await Repo.instance.watchPairsAsGuardian().first;
+        if (mine.isEmpty) {
+          return const GuardianInviteScreen(); // nobody paired yet: start with an invite
+        }
         return const GuardianShell();
       }
 
@@ -176,5 +181,131 @@ class PermissionFlow {
       }
     }
     return true;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QR SCANNER (Traveler scans the Guardian's invite)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Accepts either the full invite link (safestride://pair?code=123456) or a bare 6-digit code.
+String? parsePairingCode(String? raw) {
+  if (raw == null) {
+    return null;
+  }
+  final text = raw.trim();
+  String? code;
+  if (text.startsWith('safestride://')) {
+    code = Uri.tryParse(text)?.queryParameters['code'];
+  } else {
+    code = text;
+  }
+  if (code != null && RegExp(r'^\d{6}$').hasMatch(code)) {
+    return code;
+  }
+  return null;
+}
+
+class QrScanScreen extends StatefulWidget {
+  const QrScanScreen({super.key});
+  @override
+  State<QrScanScreen> createState() => _QrScanScreenState();
+}
+
+class _QrScanScreenState extends State<QrScanScreen> {
+  final MobileScannerController _ctl = MobileScannerController(
+    formats: const [BarcodeFormat.qrCode],
+    detectionSpeed: DetectionSpeed.noDuplicates,
+  );
+  bool _done = false;
+  bool _torch = false;
+  String? _hint;
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_done) {
+      return;
+    }
+    for (final b in capture.barcodes) {
+      final code = parsePairingCode(b.rawValue);
+      if (code != null) {
+        _done = true;
+        Navigator.pop(context, code);
+        return;
+      }
+    }
+    setState(() => _hint = "That QR code isn't a SafeStride invite.");
+  }
+
+  @override
+  void dispose() {
+    _ctl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          MobileScanner(controller: _ctl, onDetect: _onDetect),
+          // Viewfinder frame
+          Center(
+            child: Container(
+              width: 250,
+              height: 250,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white, width: 3),
+                borderRadius: BorderRadius.circular(24),
+              ),
+            ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.close, color: Colors.white),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: () async {
+                      await _ctl.toggleTorch();
+                      setState(() => _torch = !_torch);
+                    },
+                    icon: Icon(
+                      _torch ? Icons.flash_on : Icons.flash_off,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Positioned(
+            left: 24,
+            right: 24,
+            bottom: 48,
+            child: Column(
+              children: [
+                Text(
+                  _hint ?? "Point the camera at your Guardian's invite QR code",
+                  textAlign: TextAlign.center,
+                  style: ssBody(bold: true, size: 14, color: Colors.white),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'If the screen stays black, allow camera access in your phone settings.',
+                  textAlign: TextAlign.center,
+                  style: ssBody(size: 11.5, color: Colors.white70),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
