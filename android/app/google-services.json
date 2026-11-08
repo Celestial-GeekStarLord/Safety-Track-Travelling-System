@@ -12,7 +12,20 @@
           "package_name": "com.example.safestride"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_id": "1056876232559-1kg1m2vebnk5enc41ei68q0gmq0iiemh.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.safestride",
+            "certificate_hash": "f26f519e65884b7911656c11749c6cca2b7d08d1"
+          }
+        },
+        {
+          "client_id": "1056876232559-jd2lmqj405d85mgmkd91msnjvhcd5d78.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
       "api_key": [
         {
           "current_key": "AIzaSyCeiF4e-bE3I75R-Ni9jpt2elB_mvelJew"
@@ -20,7 +33,12 @@
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1056876232559-jd2lmqj405d85mgmkd91msnjvhcd5d78.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
         }
       }
     }
