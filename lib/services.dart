@@ -367,7 +367,9 @@ class OfflineStore {
       _meta.put('zones', jsonEncode(z.map((e) => e.toMap()).toList()));
   static List<SafeZone> zones() {
     final s = _meta.get('zones');
-    if (s == null) return [];
+    if (s == null) {
+      return [];
+    }
     return (jsonDecode(s) as List)
         .map((e) => SafeZone.fromMap(Map<String, dynamic>.from(e as Map)))
         .toList();
@@ -378,6 +380,31 @@ class OfflineStore {
   static List<String> guardians() {
     final s = _meta.get('guardians');
     return s == null ? [] : List<String>.from(jsonDecode(s) as List);
+  }
+
+  // simple on/off preferences that must survive restarts (e.g. the Traveler's sharing choice)
+  static bool flag(String key, {bool def = true}) {
+    try {
+      final v = _meta.get('flag_$key');
+      return v == null ? def : v == '1';
+    } catch (_) {
+      return def;
+    }
+  }
+
+  static Future<void> setFlag(String key, bool v) async {
+    try {
+      await _meta.put('flag_$key', v ? '1' : '0');
+    } catch (_) {}
+  }
+
+  /// Wipe everything stored on this phone (used at sign-out so data never leaks between accounts).
+  static Future<void> clearAll() async {
+    try {
+      await _points.clear();
+      await _events.clear();
+      await _meta.clear();
+    } catch (_) {}
   }
 
   static Future<void> setLastSync(int ts) => _meta.put('lastSync', '$ts');
@@ -455,7 +482,9 @@ String fmtTime(int ms) {
 }
 
 String fmtDuration(int minutes) {
-  if (minutes < 60) return '$minutes min';
+  if (minutes < 60) {
+    return '$minutes min';
+  }
   final h = minutes ~/ 60, m = minutes % 60;
   return m == 0 ? '${h}h' : '${h}h ${m}m';
 }
@@ -469,7 +498,9 @@ Future<String?> reverseGeocode(double lat, double lng) async {
   try {
     // geocoding 5.x: instance-based API (4.x and older used a top-level function)
     final list = await _geocoder.placemarkFromCoordinates(lat, lng);
-    if (list.isEmpty) return null;
+    if (list.isEmpty) {
+      return null;
+    }
     final m = list.first;
     final name = (m.name != null && m.name!.isNotEmpty) ? m.name : m.street;
     return (name == null || name.isEmpty) ? null : name;
@@ -660,7 +691,9 @@ class Repo {
   // ── users + push
   Future<void> saveProfile({required String name, required String role}) async {
     final u = uid;
-    if (u == null) return;
+    if (u == null) {
+      return;
+    }
     await _db.collection('users').doc(u).set({
       'name': name,
       'role': role,
@@ -671,7 +704,9 @@ class Repo {
   /// Stores the FCM token so a Cloud Function can push alerts to this Guardian.
   Future<void> registerPushToken() async {
     final u = uid;
-    if (u == null) return;
+    if (u == null) {
+      return;
+    }
     final fm = FirebaseMessaging.instance;
     await fm.requestPermission();
     final token = await fm.getToken();
@@ -703,9 +738,12 @@ class Repo {
   Future<String?> lookupCode(String code) async {
     final snap = await _db.collection('pairingCodes').doc(code).get();
     final d = snap.data();
-    if (d == null || d['used'] == true) return null;
-    if ((d['expiresAt'] as int) < DateTime.now().millisecondsSinceEpoch)
+    if (d == null || d['used'] == true) {
       return null;
+    }
+    if ((d['expiresAt'] as int) < DateTime.now().millisecondsSinceEpoch) {
+      return null;
+    }
     return d['guardianName'] as String?;
   }
 
@@ -718,7 +756,9 @@ class Repo {
     await _db.runTransaction((tx) async {
       final snap = await tx.get(ref);
       final d = snap.data();
-      if (d == null || d['used'] == true) throw Exception('Code already used');
+      if (d == null || d['used'] == true) {
+        throw Exception('Code already used');
+      }
       if ((d['expiresAt'] as int) < DateTime.now().millisecondsSinceEpoch) {
         throw Exception('Code expired');
       }
@@ -759,8 +799,11 @@ class Repo {
       .map((s) => s.docs.map((d) => PairInfo.fromMap(d.id, d.data())).toList());
 
   /// Traveler device: keep guardians + zones cached for offline geofencing.
+  StreamSubscription<dynamic>? _zonesSub;
+
   StreamSubscription<dynamic> syncCachesForTraveler() {
-    _db
+    _zonesSub?.cancel();
+    _zonesSub = _db
         .collection('zones')
         .where('travelerUids', arrayContains: uid)
         .snapshots()
@@ -768,10 +811,15 @@ class Repo {
           OfflineStore.saveZones(
             s.docs.map((d) => SafeZone.fromMap(d.data())).toList(),
           );
-        });
+        }, onError: (_) {});
     return watchPairsAsTraveler().listen((pairs) {
       OfflineStore.saveGuardians(pairs.map((p) => p.guardianUid).toList());
-    });
+    }, onError: (_) {});
+  }
+
+  void stopCaches() {
+    _zonesSub?.cancel();
+    _zonesSub = null;
   }
 
   // ── live + history streams (Guardian screens, step 4)
@@ -858,6 +906,7 @@ class TrackingService extends ChangeNotifier {
 
   // public state the Traveler UI listens to
   bool running = false;
+  String? problem; // why tracking could not start (shown on Traveler Home)
   bool online = true;
   String connection = 'Wi-Fi';
   int battery = -1;
@@ -892,17 +941,32 @@ class TrackingService extends ChangeNotifier {
     required String travelerUid,
     required String travelerName,
   }) async {
-    if (running) return true;
+    if (running) {
+      return true;
+    }
     _uid = travelerUid;
     _name = travelerName;
     _engine = GeofenceEngine(travelerUid: _uid, travelerName: _name);
 
-    if (!await Geolocator.isLocationServiceEnabled()) return false;
+    problem = null;
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      problem = 'Location is turned off on this phone.';
+      notifyListeners();
+      return false;
+    }
     var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied)
+    if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
-    if (perm == LocationPermission.denied ||
-        perm == LocationPermission.deniedForever) {
+    }
+    if (perm == LocationPermission.deniedForever) {
+      problem =
+          'Location permission is blocked. Open phone settings to allow it.';
+      notifyListeners();
+      return false;
+    }
+    if (perm == LocationPermission.denied) {
+      problem = 'SafeStride needs location permission to share your journey.';
+      notifyListeners();
       return false;
     }
     // NOTE: for "Always" on Android 10+/iOS, ask via permission_handler's Permission.locationAlways
@@ -910,7 +974,9 @@ class TrackingService extends ChangeNotifier {
 
     running = true;
     _lastMovingAt = DateTime.now().millisecondsSinceEpoch;
-    if (backendReady) _cacheSub = Repo.instance.syncCachesForTraveler();
+    if (backendReady) {
+      _cacheSub = Repo.instance.syncCachesForTraveler();
+    }
 
     _subscribePosition();
 
@@ -927,7 +993,9 @@ class TrackingService extends ChangeNotifier {
 
     try {
       _stepSub = Pedometer.stepCountStream.listen((s) {
-        if (_stepBase < 0) _stepBase = s.steps;
+        if (_stepBase < 0) {
+          _stepBase = s.steps;
+        }
         _stepNow = s.steps - _stepBase;
       }, onError: (_) {});
     } catch (_) {}
@@ -935,7 +1003,9 @@ class TrackingService extends ChangeNotifier {
     _heartbeat = Timer.periodic(const Duration(minutes: 1), (_) async {
       await _refreshBattery();
       _refreshPending();
-      if (online) await flush(force: true);
+      if (online) {
+        await flush(force: true);
+      }
       notifyListeners();
     });
 
@@ -950,6 +1020,9 @@ class TrackingService extends ChangeNotifier {
     await _conn?.cancel();
     await _stepSub?.cancel();
     await _cacheSub?.cancel();
+    if (backendReady) {
+      Repo.instance.stopCaches();
+    }
     _heartbeat?.cancel();
     running = false;
     notifyListeners();
@@ -961,15 +1034,23 @@ class TrackingService extends ChangeNotifier {
     online = _isOnline(c);
     connection = _label(c);
     await _refreshBattery();
-    if (online) await flush(force: true);
+    if (online) {
+      await flush(force: true);
+    }
     _refreshPending();
     notifyListeners();
   }
 
   String _label(List<ConnectivityResult> r) {
-    if (r.contains(ConnectivityResult.wifi)) return 'Wi-Fi';
-    if (r.contains(ConnectivityResult.mobile)) return 'Mobile data';
-    if (r.isEmpty || r.contains(ConnectivityResult.none)) return 'Offline';
+    if (r.contains(ConnectivityResult.wifi)) {
+      return 'Wi-Fi';
+    }
+    if (r.contains(ConnectivityResult.mobile)) {
+      return 'Mobile data';
+    }
+    if (r.isEmpty || r.contains(ConnectivityResult.none)) {
+      return 'Offline';
+    }
     return 'Connected';
   }
 
@@ -1016,7 +1097,9 @@ class TrackingService extends ChangeNotifier {
 
   Future<void> _onPosition(Position pos) async {
     final now = pos.timestamp.millisecondsSinceEpoch;
-    if (pos.speed > 0.7) _lastMovingAt = now;
+    if (pos.speed > 0.7) {
+      _lastMovingAt = now;
+    }
 
     // adaptive mode
     final newMode = (battery >= 0 && battery <= 20)
@@ -1066,7 +1149,9 @@ class TrackingService extends ChangeNotifier {
     // 3) upload when online, on schedule or when something noteworthy happened
     final due =
         now - _lastUpload >= _uploadEvery.inMilliseconds || events.isNotEmpty;
-    if (online && due) await flush();
+    if (online && due) {
+      await flush();
+    }
 
     if (changed)
       _subscribePosition(); // re-subscribe with new accuracy / filter
@@ -1074,14 +1159,18 @@ class TrackingService extends ChangeNotifier {
 
   /// Adds "near <street>" to the event text when we can look it up (needs internet).
   Future<void> _addContext(JourneyEvent e) async {
-    if (!online) return;
+    if (!online) {
+      return;
+    }
     final street = await reverseGeocode(e.lat, e.lng);
     if (street != null) e.body = '${e.body} Near $street.';
   }
 
   // ── batch sync
   Future<void> flush({bool force = false}) async {
-    if (!backendReady || _flushing || !online) return;
+    if (!backendReady || _flushing || !online) {
+      return;
+    }
     _flushing = true;
     try {
       final db = FirebaseFirestore.instance;
@@ -1195,24 +1284,34 @@ class OfflineStoreSafe {
 //
 // rules_version = '2';
 // service cloud.firestore {
-//   match /databases/{db}/documents {
+//   match /databases/{database}/documents {
 //     function signedIn() { return request.auth != null; }
 //     function isGuardianOf(t) {
-//       return request.auth.uid in get(/databases/$(db)/documents/users/$(t)).data.guardians;
+//       return request.auth.uid in get(/databases/$(database)/documents/users/$(t)).data.get('guardians', []);
 //     }
-//     match /users/{u}        { allow read, write: if signedIn() && request.auth.uid == u;
-//                               allow read: if signedIn() && request.auth.uid in resource.data.get('guardians', []); }
-//     match /pairingCodes/{c} { allow get, create, update: if signedIn(); allow list: if false; }
-//     match /pairs/{p}        { allow read, update, delete: if signedIn() && request.auth.uid in resource.data.members;
-//                               allow create: if signedIn(); }
-//     match /zones/{z}        { allow read: if signedIn() && (request.auth.uid == resource.data.guardianUid ||
-//                                                              request.auth.uid in resource.data.travelerUids);
-//                               allow write: if signedIn() && request.auth.uid == request.resource.data.guardianUid; }
-//     match /alerts/{a}       { allow read, update: if signedIn() && request.auth.uid == resource.data.guardianUid;
-//                               allow create: if signedIn(); }
+//     match /users/{u} { allow read, write: if signedIn() && request.auth.uid == u; }
+//     match /pairingCodes/{c} {
+//       allow get, create, update: if signedIn();
+//       allow list: if false;
+//     }
+//     match /pairs/{p} {
+//       allow read, update, delete: if signedIn() &&
+//         (request.auth.uid == resource.data.guardianUid || request.auth.uid == resource.data.travelerUid);
+//       allow create: if signedIn() && request.auth.uid in request.resource.data.members;
+//     }
+//     match /zones/{z} {
+//       allow read: if signedIn() && (request.auth.uid == resource.data.guardianUid ||
+//                                     request.auth.uid in resource.data.travelerUids);
+//       allow create, update: if signedIn() && request.auth.uid == request.resource.data.guardianUid;
+//       allow delete: if signedIn() && request.auth.uid == resource.data.guardianUid;
+//     }
+//     match /alerts/{a} {
+//       allow read, update: if signedIn() && request.auth.uid == resource.data.guardianUid;
+//       allow create: if signedIn() && request.auth.uid == request.resource.data.travelerUid;
+//     }
 //     match /travelers/{t}/{doc=**} {
 //       allow write: if signedIn() && request.auth.uid == t;
-//       allow read:  if signedIn() && (request.auth.uid == t || isGuardianOf(t));
+//       allow read: if signedIn() && (request.auth.uid == t || isGuardianOf(t));
 //     }
 //   }
 // }

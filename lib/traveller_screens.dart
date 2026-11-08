@@ -16,6 +16,7 @@ import 'package:provider/provider.dart';
 
 import 'main.dart';
 import 'services.dart';
+import 'session.dart';
 
 /// Demo only: flips Home / Device between online and offline states.
 final ValueNotifier<bool> demoOffline = ValueNotifier(false);
@@ -89,10 +90,16 @@ class TravelerVm {
 }
 
 String _ago(int? ts) {
-  if (ts == null) return 'not yet';
+  if (ts == null) {
+    return 'not yet';
+  }
   final m = ((DateTime.now().millisecondsSinceEpoch - ts) / 60000).round();
-  if (m < 1) return 'just now';
-  if (m < 60) return '$m min ago';
+  if (m < 1) {
+    return 'just now';
+  }
+  if (m < 60) {
+    return '$m min ago';
+  }
   return '${m ~/ 60} h ago';
 }
 
@@ -168,9 +175,13 @@ class _TravelerHomeState extends State<TravelerHome> {
 
   /// Reverse-geocodes the last fix (only when it moved ~100 m, and only when online).
   void _resolvePlace(LocationPoint? p) {
-    if (p == null || !widget.vm.online) return;
+    if (p == null || !widget.vm.online) {
+      return;
+    }
     final key = '${p.lat.toStringAsFixed(3)},${p.lng.toStringAsFixed(3)}';
-    if (key == _placeKey) return;
+    if (key == _placeKey) {
+      return;
+    }
     _placeKey = key;
     reverseGeocode(p.lat, p.lng).then((name) {
       if (mounted && name != null) setState(() => _place = name);
@@ -203,6 +214,20 @@ class _TravelerHomeState extends State<TravelerHome> {
               ? 'Offline, not forgotten.'
               : (app.sharingPaused ? 'Taking a pause.' : 'Connected, quietly.'),
         ),
+        if (backendReady &&
+            app.shareLocation &&
+            !app.sharingPaused &&
+            !TrackingService.instance.running &&
+            TrackingService.instance.problem != null)
+          _ProblemCard(
+            message: TrackingService.instance.problem!,
+            onFix: () async {
+              final ok = await PermissionFlow.requestAll(context);
+              if (ok) {
+                await app.startTracking();
+              }
+            },
+          ),
         ...body,
         if (vm.demo)
           Padding(
@@ -480,7 +505,9 @@ class SharingScreen extends StatelessWidget {
         ),
       ),
     );
-    if (picked == null) return;
+    if (picked == null) {
+      return;
+    }
     await app.setPaused(
       true,
       forDuration: picked == Duration.zero ? null : picked,
@@ -519,9 +546,11 @@ class SharingScreen extends StatelessWidget {
         ],
       ),
     );
-    if (ok != true) return;
+    if (ok != true) {
+      return;
+    }
     await app.endConnection();
-    nav.pushNamedAndRemoveUntil('/', (r) => false);
+    nav.pushNamedAndRemoveUntil('/welcome', (r) => false);
   }
 
   @override
@@ -578,7 +607,21 @@ class SharingScreen extends StatelessWidget {
                 'Share my location',
                 'Current location and journey history.',
                 app.shareLocation,
-                app.setShareLocation,
+                (v) async {
+                  if (v && backendReady) {
+                    final ok = await PermissionFlow.requestAll(context);
+                    if (!ok) {
+                      if (context.mounted) {
+                        ssToast(
+                          context,
+                          'Location permission is needed to share your location.',
+                        );
+                      }
+                      return;
+                    }
+                  }
+                  app.setShareLocation(v);
+                },
               ),
               const Divider(height: 1, color: SS.line),
               _toggle(
@@ -618,6 +661,12 @@ class SharingScreen extends StatelessWidget {
               'End connection with ${_first(g)}',
               style: ssBody(bold: true, color: SS.amberText),
             ),
+          ),
+        ),
+        Center(
+          child: TextButton(
+            onPressed: () => ssSignOut(context),
+            child: Text('Sign out', style: ssBody(bold: true, color: SS.muted)),
           ),
         ),
       ],
@@ -667,7 +716,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
     } else {
       await TrackingService.instance.recheck();
     }
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
     setState(() => _checking = false);
     ssToast(
       context,
@@ -825,4 +876,53 @@ class _DeviceScreenState extends State<DeviceScreen> {
       ),
     );
   }
+}
+
+/// Shown on Traveler Home when tracking could not start.
+class _ProblemCard extends StatelessWidget {
+  final String message;
+  final VoidCallback onFix;
+  const _ProblemCard({required this.message, required this.onFix});
+
+  @override
+  Widget build(BuildContext context) => SSCard(
+    color: SS.amber,
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(
+              Icons.location_off_outlined,
+              color: SS.amberText,
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Sharing is not running',
+                style: ssBody(bold: true, size: 14.5),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(message, style: ssBody(size: 12.5, color: SS.amberText)),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(child: SSButton('Fix now', onPressed: onFix)),
+            const SizedBox(width: 10),
+            Expanded(
+              child: SSButton(
+                'Phone settings',
+                filled: false,
+                onPressed: Geolocator.openAppSettings,
+              ),
+            ),
+          ],
+        ),
+      ],
+    ),
+  );
 }

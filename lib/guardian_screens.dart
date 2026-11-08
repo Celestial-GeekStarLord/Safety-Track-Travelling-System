@@ -764,6 +764,21 @@ class PeopleScreen extends StatelessWidget {
                         style: ssBody(size: 11.5, color: SS.muted),
                       ),
                     ),
+                    Center(
+                      child: TextButton(
+                        onPressed: () => ssSignOut(context),
+                        child: Text(
+                          app.email.isEmpty
+                              ? 'Sign out'
+                              : 'Signed in as ${app.email} · Sign out',
+                          style: ssBody(
+                            bold: true,
+                            size: 12.5,
+                            color: SS.muted,
+                          ),
+                        ),
+                      ),
+                    ),
                   ],
                 );
               },

@@ -25,6 +25,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import 'guardian_screens.dart';
 import 'services.dart';
+import 'session.dart';
 import 'traveller_screens.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,6 +126,7 @@ enum UserRole { traveler, guardian }
 class AppState extends ChangeNotifier {
   UserRole role = UserRole.traveler;
   String email = '';
+  String name = ''; // full name chosen at sign-up
   bool signedIn = false;
 
   // Traveler consent
@@ -147,16 +149,65 @@ class AppState extends ChangeNotifier {
 
   void setShareLocation(bool v) {
     shareLocation = v;
+    OfflineStore.setFlag('shareLocation', v);
     notifyListeners();
     if (paired && backendReady && !sharingPaused) {
-      v ? _startTracking() : TrackingService.instance.stop();
+      v ? startTracking() : TrackingService.instance.stop();
     }
   }
 
-  Future<void> _startTracking() => TrackingService.instance.start(
-    travelerUid: Repo.instance.uid!,
-    travelerName: displayName,
-  );
+  /// Starts background tracking. Returns false (and sets TrackingService.problem) on failure.
+  Future<bool> startTracking() {
+    final uid = Repo.instance.uid;
+    if (uid == null) {
+      return Future.value(false);
+    }
+    return TrackingService.instance.start(
+      travelerUid: uid,
+      travelerName: displayName,
+    );
+  }
+
+  /// Called by SessionGate when a paired Traveler reopens the app.
+  Future<void> restoreTraveler(PairInfo p) async {
+    paired = true;
+    guardianName = p.guardianName;
+    sharingPaused = p.sharingPaused;
+    shareLocation = OfflineStore.flag('shareLocation');
+    shareDeviceStatus = OfflineStore.flag('shareDevice');
+    notifyListeners();
+    if (shareLocation && !sharingPaused) {
+      await startTracking();
+    }
+  }
+
+  /// Flush what we can, stop tracking, clear local data, sign out of Firebase.
+  Future<void> signOut() async {
+    _resumeTimer?.cancel();
+    _ticker?.cancel();
+    if (backendReady) {
+      if (TrackingService.instance.running) {
+        await TrackingService.instance.flush(force: true);
+      }
+      await TrackingService.instance.stop();
+    }
+    if (firebaseReady) {
+      await FirebaseAuth.instance.signOut();
+    }
+    await OfflineStore.clearAll();
+    email = '';
+    name = '';
+    signedIn = false;
+    paired = false;
+    sharingPaused = false;
+    pausedUntil = null;
+    syncCode = '';
+    codeExpiry = null;
+    shareLocation = true;
+    shareDeviceStatus = true;
+    guardianName = 'Maya Lee';
+    notifyListeners();
+  }
 
   // Pause / resume sharing (Traveler > Sharing tab)
   bool sharingPaused = false;
@@ -182,7 +233,7 @@ class AppState extends ChangeNotifier {
     if (paused) {
       await TrackingService.instance.stop();
     } else if (shareLocation) {
-      await _startTracking();
+      await startTracking();
     }
   }
 
@@ -203,6 +254,7 @@ class AppState extends ChangeNotifier {
 
   void setShareDevice(bool v) {
     shareDeviceStatus = v;
+    OfflineStore.setFlag('shareDevice', v);
     notifyListeners();
   }
 
@@ -211,6 +263,7 @@ class AppState extends ChangeNotifier {
     String mail,
     String password, {
     bool create = false,
+    String fullName = '',
   }) async {
     email = mail.trim();
     if (email.isEmpty || password.length < 6) {
@@ -224,12 +277,18 @@ class AppState extends ChangeNotifier {
             email: email,
             password: password,
           );
+          if (fullName.trim().isNotEmpty) {
+            await auth.currentUser?.updateDisplayName(fullName.trim());
+          }
         } else {
           await auth.signInWithEmailAndPassword(
             email: email,
             password: password,
           );
         }
+        name = fullName.trim().isNotEmpty
+            ? fullName.trim()
+            : (auth.currentUser?.displayName ?? '');
       } on FirebaseAuthException catch (e) {
         return e.message ?? 'Could not sign in. Please try again.';
       }
@@ -272,6 +331,15 @@ class AppState extends ChangeNotifier {
   }
 
   String get displayName {
+    if (name.trim().isNotEmpty) {
+      return name.trim();
+    }
+    final fromAuth = firebaseReady
+        ? FirebaseAuth.instance.currentUser?.displayName
+        : null;
+    if (fromAuth != null && fromAuth.trim().isNotEmpty) {
+      return fromAuth.trim();
+    }
     final base = email.split('@').first;
     if (base.isEmpty) {
       return role == UserRole.guardian ? 'Guardian' : 'Traveler';
@@ -311,10 +379,7 @@ class AppState extends ChangeNotifier {
         travelerName: displayName,
       );
       if (shareLocation) {
-        await TrackingService.instance.start(
-          travelerUid: Repo.instance.uid!,
-          travelerName: displayName,
-        );
+        await startTracking();
       }
     }
     paired = true;
@@ -343,7 +408,8 @@ class SafeStrideApp extends StatelessWidget {
       theme: SS.theme(),
       initialRoute: '/',
       routes: {
-        '/': (_) => const WelcomeScreen(),
+        '/': (_) => const SessionGate(),
+        '/welcome': (_) => const WelcomeScreen(),
         '/signin': (_) => const SignInScreen(),
         '/consent': (_) => const TravelerConsentScreen(),
         '/invite': (_) => const GuardianInviteScreen(),
@@ -838,6 +904,46 @@ class SSBottomNav extends StatelessWidget {
   );
 }
 
+/// Confirm, then sign out and return to Welcome.
+Future<void> ssSignOut(BuildContext context) async {
+  final app = context.read<AppState>();
+  final nav = Navigator.of(context);
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (dialogCtx) => AlertDialog(
+      backgroundColor: SS.bg,
+      title: Text('Sign out?', style: ssBody(bold: true, size: 18)),
+      content: Text(
+        app.role == UserRole.traveler
+            ? 'Sharing stops on this phone until you sign in again.'
+            : 'You will stop seeing live updates on this phone until you sign in again.',
+        style: ssSub(),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogCtx, false),
+          child: Text(
+            'Stay signed in',
+            style: ssBody(bold: true, color: SS.teal),
+          ),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(dialogCtx, true),
+          child: Text(
+            'Sign out',
+            style: ssBody(bold: true, color: SS.amberText),
+          ),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) {
+    return;
+  }
+  await app.signOut();
+  nav.pushNamedAndRemoveUntil('/welcome', (r) => false);
+}
+
 void ssToast(BuildContext c, String msg) =>
     ScaffoldMessenger.of(c).showSnackBar(
       SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
@@ -980,6 +1086,7 @@ class SignInScreen extends StatefulWidget {
 class _SignInScreenState extends State<SignInScreen> {
   final _email = TextEditingController();
   final _pass = TextEditingController();
+  final _fullName = TextEditingController();
   bool _create = false;
   bool _hide = true;
   bool _busy = false;
@@ -989,6 +1096,7 @@ class _SignInScreenState extends State<SignInScreen> {
   void dispose() {
     _email.dispose();
     _pass.dispose();
+    _fullName.dispose();
     super.dispose();
   }
 
@@ -998,7 +1106,19 @@ class _SignInScreenState extends State<SignInScreen> {
       _error = null;
     });
     final state = context.read<AppState>();
-    final err = await state.signIn(_email.text, _pass.text, create: _create);
+    if (_create && _fullName.text.trim().isEmpty) {
+      setState(() {
+        _busy = false;
+        _error = 'Add your name so your circle knows who you are.';
+      });
+      return;
+    }
+    final err = await state.signIn(
+      _email.text,
+      _pass.text,
+      create: _create,
+      fullName: _fullName.text,
+    );
     if (!mounted) {
       return;
     }
@@ -1032,6 +1152,12 @@ class _SignInScreenState extends State<SignInScreen> {
           onChanged: (v) => setState(() => _create = v),
         ),
         const SizedBox(height: 16),
+        if (_create) ...[
+          Text('Your name', style: ssBody(bold: true, size: 12.5)),
+          const SizedBox(height: 6),
+          _field(_fullName, 'Maya Lee'),
+          const SizedBox(height: 14),
+        ],
         Text('Email address', style: ssBody(bold: true, size: 12.5)),
         const SizedBox(height: 6),
         _field(
@@ -1283,9 +1409,19 @@ class TravelerConsentScreen extends StatelessWidget {
         SSButton(
           'Agree & enable location',
           onPressed: () async {
-            // STEP 2: request permissions here via permission_handler / geolocator:
-            //   await Permission.locationWhenInUse.request();
-            //   await Permission.locationAlways.request();
+            final ok = backendReady
+                ? await PermissionFlow.requestAll(context)
+                : true;
+            if (!context.mounted) {
+              return;
+            }
+            s.setShareLocation(ok);
+            if (!ok) {
+              ssToast(
+                context,
+                'Location permission was not granted. You can turn sharing on later from the Sharing tab.',
+              );
+            }
             Navigator.pushNamed(context, '/pair');
           },
         ),
@@ -1340,12 +1476,36 @@ class GuardianInviteScreen extends StatefulWidget {
 }
 
 class _GuardianInviteScreenState extends State<GuardianInviteScreen> {
+  StreamSubscription<List<PairInfo>>? _sub;
+  Set<String>? _known;
+  String? _joined; // name of the Traveler who just paired
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => context.read<AppState>().generateCode(),
     );
+    if (backendReady) {
+      _sub = Repo.instance.watchPairsAsGuardian().listen((pairs) {
+        final ids = pairs.map((p) => p.id).toSet();
+        if (_known == null) {
+          _known = ids; // first emission = who was already paired
+          return;
+        }
+        final fresh = pairs.where((p) => !_known!.contains(p.id)).toList();
+        _known = ids;
+        if (fresh.isNotEmpty && mounted) {
+          setState(() => _joined = fresh.first.travelerName);
+        }
+      }, onError: (_) {});
+    }
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
   }
 
   String _fmtCode(String c) =>
@@ -1370,6 +1530,23 @@ class _GuardianInviteScreenState extends State<GuardianInviteScreen> {
     return SSScaffold(
       trailing: 'Guardian setup',
       children: [
+        if (_joined != null) ...[
+          SSInfo(
+            icon: Icons.check_circle_outline,
+            title: '$_joined joined your circle',
+            body:
+                'Their location and device status will now appear on your dashboard.',
+          ),
+          SSButton(
+            'Go to dashboard',
+            onPressed: () => Navigator.pushNamedAndRemoveUntil(
+              context,
+              '/guardian',
+              (r) => false,
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
         const SSHeader(
           eyebrow: 'Connect your circle',
           title: 'Invite your Traveler',
