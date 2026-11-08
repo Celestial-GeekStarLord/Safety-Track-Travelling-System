@@ -14,10 +14,13 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart' show MapController;
 import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 
 import 'main.dart';
+import 'maps.dart';
 import 'services.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +230,10 @@ class GD {
   ) => demo
       ? Stream.value(_demoEvents(p))
       : Repo.instance.watchEvents(p.travelerUid, from, to);
+
+  static Stream<List<LocationPoint>> recent(PairInfo p) => demo
+      ? Stream.value(const <LocationPoint>[])
+      : Repo.instance.watchRecentPoints(p.travelerUid);
 
   static Stream<List<LocationPoint>> points(
     PairInfo p,
@@ -547,6 +554,13 @@ String _dayLabel(DateTime d) =>
 bool _sameDay(DateTime a, DateTime b) =>
     a.year == b.year && a.month == b.month && a.day == b.day;
 
+IconData _kindIcon(EventKind k) => switch (k) {
+  EventKind.unexpectedStop => Icons.coffee_outlined,
+  EventKind.left => Icons.logout,
+  EventKind.distanceThreshold => Icons.straighten,
+  EventKind.arrived => Icons.login,
+};
+
 IconData _zoneIcon(ZoneType t) => switch (t) {
   ZoneType.home => Icons.home_outlined,
   ZoneType.school => Icons.school_outlined,
@@ -863,11 +877,21 @@ class _TravelerCard extends StatelessWidget {
               ),
               const SizedBox(height: 12),
               if (atZone == null) ...[
-                MiniMap(
-                  height: 130,
-                  showRoute: true,
+                LiveMap(
+                  height: 140,
+                  mode: MapMode.fixed,
+                  center: p == null ? null : ll(p),
                   initials: _initials(pair.travelerName),
                   markerFaded: !online,
+                  zones: zones
+                      .where((z) => z.travelerUids.contains(pair.travelerUid))
+                      .toList(),
+                  fallback: MiniMap(
+                    height: 130,
+                    showRoute: true,
+                    initials: _initials(pair.travelerName),
+                    markerFaded: !online,
+                  ),
                 ),
                 const SizedBox(height: 10),
                 Row(
@@ -1002,11 +1026,25 @@ class TravelerDetail extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 14),
-            MiniMap(
-              height: 190,
-              showRoute: atZone == null,
-              initials: _initials(pair.travelerName),
-              markerFaded: !online,
+            Src<List<LocationPoint>>(
+              create: () => GD.recent(pair),
+              initial: const [],
+              builder: (c, recent) => LiveMap(
+                height: 230,
+                center: p == null ? null : ll(p),
+                initials: _initials(pair.travelerName),
+                markerFaded: !online,
+                route: decimate(recent.map(ll).toList()),
+                zones: zones
+                    .where((z) => z.travelerUids.contains(pair.travelerUid))
+                    .toList(),
+                fallback: MiniMap(
+                  height: 190,
+                  showRoute: atZone == null,
+                  initials: _initials(pair.travelerName),
+                  markerFaded: !online,
+                ),
+              ),
             ),
             const SizedBox(height: 10),
             SSCard(
@@ -1234,6 +1272,15 @@ class _ZonesScreenState extends State<ZonesScreen> {
                     onChanged: (i) => setState(() => _filter = i),
                   ),
                   const SizedBox(height: 12),
+                  if (shown.any((z) => z.lat != 0 || z.lng != 0)) ...[
+                    LiveMap(
+                      height: 180,
+                      zones: shown,
+                      emptyText: 'Add a safe zone to see it here',
+                      fallback: const SizedBox.shrink(),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
                   if (shown.isEmpty)
                     const SSInfo(
                       icon: Icons.add_location_alt_outlined,
@@ -1331,6 +1378,10 @@ class _ZoneEditorState extends State<ZoneEditor> {
   late String _address = widget.zone?.address ?? '';
   bool _locating = false;
   bool _initWho = false;
+  final MapController _map = MapController();
+  final TextEditingController _search = TextEditingController();
+
+  LatLng? get _center => (_lat == 0 && _lng == 0) ? null : LatLng(_lat, _lng);
 
   bool get _isNew => widget.zone == null;
 
@@ -1343,6 +1394,8 @@ class _ZoneEditorState extends State<ZoneEditor> {
   @override
   void dispose() {
     _name.dispose();
+    _search.dispose();
+    _map.dispose();
     super.dispose();
   }
 
@@ -1353,6 +1406,9 @@ class _ZoneEditorState extends State<ZoneEditor> {
       final pos = await Geolocator.getCurrentPosition();
       _lat = pos.latitude;
       _lng = pos.longitude;
+      try {
+        _map.move(LatLng(_lat, _lng), zoomForRadius(_radius));
+      } catch (_) {}
       final n = await reverseGeocode(_lat, _lng);
       if (n != null) _address = n;
     } catch (_) {
@@ -1363,6 +1419,44 @@ class _ZoneEditorState extends State<ZoneEditor> {
         );
     }
     if (mounted) setState(() => _locating = false);
+  }
+
+  Future<void> _searchPlace() async {
+    final q = _search.text.trim();
+    if (q.isEmpty) {
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    setState(() => _locating = true);
+    final hit = await forwardGeocode(q);
+    if (!mounted) {
+      return;
+    }
+    setState(() => _locating = false);
+    if (hit == null) {
+      ssToast(context, "Couldn't find that place. Try a fuller address.");
+      return;
+    }
+    setState(() {
+      _lat = hit.$1;
+      _lng = hit.$2;
+      _address = q;
+    });
+    try {
+      _map.move(LatLng(_lat, _lng), zoomForRadius(_radius));
+    } catch (_) {}
+  }
+
+  Future<void> _pick(LatLng p) async {
+    setState(() {
+      _lat = p.latitude;
+      _lng = p.longitude;
+      _address = '';
+    });
+    final n = await reverseGeocode(p.latitude, p.longitude);
+    if (mounted && n != null) {
+      setState(() => _address = n);
+    }
   }
 
   Future<void> _save() async {
@@ -1455,12 +1549,73 @@ class _ZoneEditorState extends State<ZoneEditor> {
                   ),
                 ),
                 const SizedBox(height: 14),
-                MiniMap(
-                  height: 170,
-                  showZone: true,
-                  initials: nm.isEmpty ? '·' : nm[0].toUpperCase(),
-                  zoneRadius: 18 + (_radius - 50) / 950 * 62,
+                if (!GD.demo) ...[
+                  TextField(
+                    controller: _search,
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => _searchPlace(),
+                    style: ssBody(size: 14),
+                    decoration: InputDecoration(
+                      hintText: 'Search an address or place',
+                      prefixIcon: const Icon(
+                        Icons.search,
+                        size: 20,
+                        color: SS.muted,
+                      ),
+                      suffixIcon: IconButton(
+                        icon: const Icon(
+                          Icons.arrow_forward,
+                          size: 20,
+                          color: SS.teal,
+                        ),
+                        onPressed: _searchPlace,
+                      ),
+                      filled: true,
+                      fillColor: Colors.white,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: SS.line),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: SS.line),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(
+                          color: SS.teal,
+                          width: 1.6,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                LiveMap(
+                  height: 250,
+                  mode: MapMode.full,
+                  controller: _map,
+                  refitOnChange: false,
+                  editCenter: _center,
+                  editRadius: _radius,
+                  onTap: _pick,
+                  emptyText: 'Tap "Use my location" or search for a place',
+                  fallback: MiniMap(
+                    height: 170,
+                    showZone: true,
+                    initials: nm.isEmpty ? '·' : nm[0].toUpperCase(),
+                    zoneRadius: 18 + (_radius - 50) / 950 * 62,
+                  ),
                 ),
+                if (!GD.demo)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      'Tap the map to move the zone centre.',
+                      style: ssBody(size: 11.5, color: SS.muted),
+                    ),
+                  ),
                 const SizedBox(height: 8),
                 Row(
                   children: [
@@ -1854,10 +2009,33 @@ class AlertDetail extends StatelessWidget {
         const SizedBox(height: 14),
         Stack(
           children: [
-            MiniMap(
-              height: 190,
-              showRoute: true,
-              initials: _initials(a.travelerName),
+            LiveBuilder(
+              pair: PairInfo(
+                id: 'x',
+                guardianUid: a.guardianUid,
+                guardianName: '',
+                travelerUid: a.travelerUid,
+                travelerName: a.travelerName,
+              ),
+              builder: (c, p, s) => LiveMap(
+                height: 220,
+                center: p == null ? null : ll(p),
+                initials: _initials(a.travelerName),
+                pins: (a.lat == null || a.lng == null)
+                    ? const []
+                    : [
+                        MapPin(
+                          LatLng(a.lat!, a.lng!),
+                          _kindIcon(a.kind),
+                          bg: SS.amberText,
+                        ),
+                      ],
+                fallback: MiniMap(
+                  height: 190,
+                  showRoute: true,
+                  initials: _initials(a.travelerName),
+                ),
+              ),
             ),
             if (a.kind == EventKind.unexpectedStop)
               Positioned(
@@ -2209,10 +2387,35 @@ class _HistoryScreenState extends State<HistoryScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const SizedBox(height: 4),
-                          MiniMap(
-                            height: 190,
-                            showRoute: true,
-                            initials: _initials(pair.travelerName),
+                          Src<List<SafeZone>>(
+                            create: GD.zones,
+                            initial: GD.zonesInit,
+                            builder: (c, zs) => LiveMap(
+                              height: 230,
+                              route: decimate(pts.map(ll).toList()),
+                              zones: zs
+                                  .where(
+                                    (z) => z.travelerUids.contains(
+                                      pair.travelerUid,
+                                    ),
+                                  )
+                                  .toList(),
+                              pins: [
+                                for (final e in evs)
+                                  if (e.lat != 0 || e.lng != 0)
+                                    MapPin(
+                                      LatLng(e.lat, e.lng),
+                                      _kindIcon(e.kind),
+                                      bg: e.alert ? SS.amberText : SS.teal,
+                                    ),
+                              ],
+                              emptyText: 'No points recorded for this period',
+                              fallback: MiniMap(
+                                height: 190,
+                                showRoute: true,
+                                initials: _initials(pair.travelerName),
+                              ),
+                            ),
                           ),
                           const SizedBox(height: 6),
                           Row(

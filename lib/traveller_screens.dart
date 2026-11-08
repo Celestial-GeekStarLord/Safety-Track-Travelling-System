@@ -15,6 +15,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:provider/provider.dart';
 
 import 'main.dart';
+import 'maps.dart';
 import 'services.dart';
 import 'session.dart';
 
@@ -109,6 +110,8 @@ String _greeting() {
 }
 
 String _first(String name) => name.split(' ').first;
+String _initialsOf(String n) =>
+    n.split(' ').where((w) => w.isNotEmpty).map((w) => w[0]).take(2).join();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SHELL
@@ -256,7 +259,15 @@ class _TravelerHomeState extends State<TravelerHome> {
         children: [SSPill('Sharing is on'), SSPill('Online')],
       ),
       const SizedBox(height: 12),
-      const MiniMap(height: 170, showRoute: true),
+      LiveMap(
+        height: 190,
+        mode: MapMode.scrollSafe,
+        center: p == null ? null : ll(p),
+        initials: _initialsOf(app.displayName),
+        route: decimate(TrackingService.instance.trail.map(ll).toList()),
+        zones: OfflineStore.zones(),
+        fallback: const MiniMap(height: 170, showRoute: true),
+      ),
       const SizedBox(height: 12),
       SSCard(
         child: Column(
@@ -347,7 +358,17 @@ class _TravelerHomeState extends State<TravelerHome> {
       const SizedBox(height: 12),
       Stack(
         children: [
-          const MiniMap(height: 170, markerFaded: true),
+          LiveMap(
+            height: 190,
+            mode: MapMode.scrollSafe,
+            center: vm.lastPoint == null ? null : ll(vm.lastPoint!),
+            initials: _initialsOf(app.displayName),
+            markerFaded: true,
+            route: decimate(TrackingService.instance.trail.map(ll).toList()),
+            zones: OfflineStore.zones(),
+            emptyText: 'No location recorded yet',
+            fallback: const MiniMap(height: 170, markerFaded: true),
+          ),
           Positioned(
             left: 10,
             bottom: 10,

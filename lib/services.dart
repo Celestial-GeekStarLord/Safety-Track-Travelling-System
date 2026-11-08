@@ -216,6 +216,7 @@ class TravelerAlert {
   final EventKind kind;
   final int ts;
   final bool reviewed;
+  final double? lat, lng; // where it happened
   TravelerAlert({
     required this.id,
     required this.guardianUid,
@@ -226,6 +227,8 @@ class TravelerAlert {
     required this.kind,
     required this.ts,
     this.reviewed = false,
+    this.lat,
+    this.lng,
   });
 
   factory TravelerAlert.fromMap(Map<String, dynamic> m) => TravelerAlert(
@@ -241,6 +244,8 @@ class TravelerAlert {
     ),
     ts: m['ts'] as int,
     reviewed: (m['reviewed'] as bool?) ?? false,
+    lat: (m['lat'] as num?)?.toDouble(),
+    lng: (m['lng'] as num?)?.toDouble(),
   );
 }
 
@@ -504,6 +509,19 @@ Future<String?> reverseGeocode(double lat, double lng) async {
     final m = list.first;
     final name = (m.name != null && m.name!.isNotEmpty) ? m.name : m.street;
     return (name == null || name.isEmpty) ? null : name;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Address or place name -> (latitude, longitude), or null when nothing is found (needs internet).
+Future<(double, double)?> forwardGeocode(String query) async {
+  try {
+    final list = await _geocoder.locationFromAddress(query);
+    if (list.isEmpty) {
+      return null;
+    }
+    return (list.first.latitude, list.first.longitude);
   } catch (_) {
     return null;
   }
@@ -839,6 +857,7 @@ class Repo {
       .snapshots()
       .map((d) => d.data() == null ? null : DeviceStatus.fromMap(d.data()!));
 
+  /// Points in a time window. Capped at the newest 2,500 to keep reads and drawing cheap.
   Stream<List<LocationPoint>> watchPoints(
     String travelerUid,
     DateTime from,
@@ -849,9 +868,35 @@ class Repo {
       .collection('points')
       .where('ts', isGreaterThanOrEqualTo: from.millisecondsSinceEpoch)
       .where('ts', isLessThan: to.millisecondsSinceEpoch)
-      .orderBy('ts')
+      .orderBy('ts', descending: true)
+      .limit(2500)
       .snapshots()
-      .map((s) => s.docs.map((d) => LocationPoint.fromMap(d.data())).toList());
+      .map(
+        (s) => s.docs
+            .map((d) => LocationPoint.fromMap(d.data()))
+            .toList()
+            .reversed
+            .toList(),
+      );
+
+  /// The latest [limit] points (oldest first) for the live route on a Traveler's detail page.
+  Stream<List<LocationPoint>> watchRecentPoints(
+    String travelerUid, {
+    int limit = 120,
+  }) => _db
+      .collection('travelers')
+      .doc(travelerUid)
+      .collection('points')
+      .orderBy('ts', descending: true)
+      .limit(limit)
+      .snapshots()
+      .map(
+        (s) => s.docs
+            .map((d) => LocationPoint.fromMap(d.data()))
+            .toList()
+            .reversed
+            .toList(),
+      );
 
   Stream<List<JourneyEvent>> watchEvents(
     String travelerUid,
@@ -912,6 +957,8 @@ class TrackingService extends ChangeNotifier {
   int battery = -1;
   double gpsAccuracy = -1;
   LocationPoint? lastPoint;
+  final List<LocationPoint> trail =
+      []; // recent fixes, drawn on the Traveler's own map
   int? lastSyncTs = OfflineStoreSafe.lastSync();
   PendingSummary pending = const PendingSummary();
   TrackMode mode = TrackMode.moving;
@@ -1131,6 +1178,10 @@ class TrackingService extends ChangeNotifier {
       battery: battery,
     );
     lastPoint = p;
+    trail.add(p);
+    if (trail.length > 150) {
+      trail.removeAt(0);
+    }
     gpsAccuracy = pos.accuracy;
 
     // 1) always buffer first (outbox)
@@ -1215,6 +1266,8 @@ class TrackingService extends ChangeNotifier {
                   'body': e.body,
                   'ts': e.ts,
                   'reviewed': false,
+                  'lat': e.lat,
+                  'lng': e.lng,
                 });
               }
             }
