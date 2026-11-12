@@ -139,6 +139,7 @@ class AppState extends ChangeNotifier {
 
   // Pairing (Guardian side generates, Traveler side enters)
   String syncCode = '';
+  String? codeError; // set when the invite code could not be saved
   DateTime? codeExpiry;
   Timer? _ticker;
 
@@ -239,6 +240,9 @@ class AppState extends ChangeNotifier {
         await TrackingService.instance.flush(force: true);
       }
       await TrackingService.instance.stop();
+    }
+    if (backendReady && role == UserRole.guardian) {
+      await Repo.instance.clearPushToken();
     }
     if (firebaseReady) {
       await FirebaseAuth.instance.signOut();
@@ -363,8 +367,15 @@ class AppState extends ChangeNotifier {
   void generateCode() {
     syncCode = (100000 + Random.secure().nextInt(900000)).toString();
     codeExpiry = DateTime.now().add(const Duration(minutes: 10));
+    codeError = null;
     if (backendReady) {
-      Repo.instance.createPairingCode(syncCode, displayName, codeExpiry!);
+      Repo.instance
+          .createPairingCode(syncCode, displayName, codeExpiry!)
+          .catchError((_) {
+            codeError =
+                'The code could not be saved. Check your connection, then tap "Generate a new code".';
+            notifyListeners();
+          });
     }
     _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -1631,6 +1642,14 @@ class _GuardianInviteScreenState extends State<GuardianInviteScreen> {
           ),
           const SizedBox(height: 14),
         ],
+        if (s.codeError != null)
+          SSInfo(
+            icon: Icons.error_outline,
+            title: 'This code is not ready',
+            body: s.codeError!,
+            color: SS.amber,
+            fg: SS.amberText,
+          ),
         const SSHeader(
           eyebrow: 'Connect your circle',
           title: 'Invite your Traveler',
@@ -1760,6 +1779,8 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
   final _focus = FocusNode();
   final _phone = TextEditingController();
   String? _guardian; // set when a valid code resolves
+  bool _checking = false;
+  String? _pairError;
 
   @override
   void dispose() {
@@ -1782,11 +1803,34 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
   }
 
   Future<void> _onChanged(String v) async {
-    setState(() => _guardian = null);
-    if (v.length == 6) {
-      final g = await context.read<AppState>().lookupGuardian(v);
-      if (mounted) setState(() => _guardian = g);
+    setState(() {
+      _guardian = null;
+      _pairError = null;
+    });
+    if (v.length != 6) {
+      return;
     }
+    setState(() => _checking = true);
+    String? name;
+    String? err;
+    try {
+      name = await context.read<AppState>().lookupGuardian(v);
+    } on PairingException catch (e) {
+      err = e.message;
+    } catch (_) {
+      err = 'Could not check that code. Check your connection and try again.';
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _checking = false;
+      _guardian = name;
+      _pairError = name == null
+          ? (err ??
+                "That code isn't valid or has expired. Ask your Guardian for a new one.")
+          : null;
+    });
   }
 
   @override
@@ -1852,6 +1896,20 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
           ),
         ),
         const SizedBox(height: 12),
+        if (_checking)
+          const Padding(
+            padding: EdgeInsets.only(top: 12),
+            child: LinearProgressIndicator(minHeight: 3, color: SS.teal),
+          ),
+        if (_pairError != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Text(
+              _pairError!,
+              style: ssBody(size: 12.5, color: SS.amberText),
+            ),
+          ),
+        const SizedBox(height: 4),
         SSButton(
           'Scan a QR code instead',
           icon: Icons.qr_code_scanner,
@@ -1938,8 +1996,23 @@ class _TravelerPairScreenState extends State<TravelerPairScreen> {
             icon: Icons.shield_outlined,
             onPressed: () async {
               final s = context.read<AppState>();
-              await s.setPhone(_phone.text);
-              await s.confirmPairing();
+              try {
+                await s.setPhone(_phone.text);
+                await s.confirmPairing();
+              } on PairingException catch (e) {
+                if (mounted) {
+                  ssToast(context, e.message);
+                }
+                return;
+              } catch (_) {
+                if (mounted) {
+                  ssToast(
+                    context,
+                    'Could not complete pairing. Check your connection and try again.',
+                  );
+                }
+                return;
+              }
               if (mounted) {
                 Navigator.pushNamedAndRemoveUntil(
                   context,

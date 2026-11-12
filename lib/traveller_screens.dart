@@ -10,9 +10,13 @@
 // In DEMO MODE (Firebase not configured) sample values are used so you can see every state,
 // and a "Preview offline" switch appears on Home.
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'main.dart';
 import 'maps.dart';
@@ -797,6 +801,30 @@ class DeviceScreen extends StatefulWidget {
 
 class _DeviceScreenState extends State<DeviceScreen> {
   bool _checking = false;
+  bool? _batteryOk; // null = unknown / not applicable
+
+  @override
+  void initState() {
+    super.initState();
+    _loadBattery();
+  }
+
+  Future<void> _loadBattery() async {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+    try {
+      final st = await Permission.ignoreBatteryOptimizations.status;
+      if (mounted) {
+        setState(() => _batteryOk = st.isGranted);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _askBattery() async {
+    await Permission.ignoreBatteryOptimizations.request();
+    await _loadBattery();
+  }
 
   Future<void> _recheck() async {
     setState(() => _checking = true);
@@ -900,6 +928,53 @@ class _DeviceScreenState extends State<DeviceScreen> {
             ],
           ),
         ),
+        if (backendReady && _batteryOk == false)
+          SSCard(
+            color: SS.amber,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.battery_alert_outlined,
+                      color: SS.amberText,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Keep sharing reliable',
+                        style: ssBody(bold: true, size: 14.5),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Some phones pause apps to save battery, which can stop location updates. Allow SafeStride to run without battery restrictions so your Guardian keeps getting updates.',
+                  style: ssBody(size: 12.5, color: SS.amberText),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(child: SSButton('Allow', onPressed: _askBattery)),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: SSButton(
+                        'Phone tips',
+                        filled: false,
+                        onPressed: () => launchUrl(
+                          Uri.parse('https://dontkillmyapp.com'),
+                          mode: LaunchMode.externalApplication,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
         SSInfo(
           icon: Icons.sync,
           title: 'Automatic background sync is on',

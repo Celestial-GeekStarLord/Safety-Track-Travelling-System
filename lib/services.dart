@@ -21,6 +21,7 @@ import 'dart:math';
 
 import 'package:battery_plus/battery_plus.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -31,6 +32,17 @@ import 'package:geolocator/geolocator.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:pedometer/pedometer.dart';
+
+/// Region of your Cloud Functions. Must equal REGION in functions/index.js.
+const String kFunctionsRegion = 'asia-south1';
+
+/// A pairing problem with a message that is safe to show the user.
+class PairingException implements Exception {
+  final String message;
+  PairingException(this.message);
+  @override
+  String toString() => message;
+}
 
 /// True when Firebase.initializeApp() succeeded (otherwise the app runs in demo mode).
 bool get backendReady => Firebase.apps.isNotEmpty;
@@ -752,6 +764,8 @@ class Repo {
   }
 
   /// Stores the FCM token so a Cloud Function can push alerts to this Guardian.
+  StreamSubscription<String>? _tokenSub;
+
   Future<void> registerPushToken() async {
     final u = uid;
     if (u == null) {
@@ -765,11 +779,54 @@ class Repo {
         'fcmToken': token,
       }, SetOptions(merge: true));
     }
-    fm.onTokenRefresh.listen(
+    await _tokenSub?.cancel();
+    _tokenSub = fm.onTokenRefresh.listen(
       (t) => _db.collection('users').doc(u).set({
         'fcmToken': t,
       }, SetOptions(merge: true)),
     );
+  }
+
+  /// Sign-out: stop this phone receiving the account's alerts.
+  Future<void> clearPushToken() async {
+    final u = uid;
+    await _tokenSub?.cancel();
+    _tokenSub = null;
+    try {
+      if (u != null) {
+        await _db.collection('users').doc(u).update({
+          'fcmToken': FieldValue.delete(),
+        });
+      }
+      await FirebaseMessaging.instance.deleteToken();
+    } catch (_) {}
+  }
+
+  // ── alert preferences + single alert lookup
+  Future<Map<String, dynamic>?> getPrefs() async {
+    final u = uid;
+    if (u == null) {
+      return null;
+    }
+    final snap = await _db.collection('users').doc(u).get();
+    final p = snap.data()?['prefs'];
+    return p == null ? null : Map<String, dynamic>.from(p as Map);
+  }
+
+  Future<void> savePrefs(Map<String, dynamic> prefs) async {
+    final u = uid;
+    if (u == null) {
+      return;
+    }
+    await _db.collection('users').doc(u).set({
+      'prefs': prefs,
+    }, SetOptions(merge: true));
+  }
+
+  Future<TravelerAlert?> getAlert(String id) async {
+    final d = await _db.collection('alerts').doc(id).get();
+    final m = d.data();
+    return m == null ? null : TravelerAlert.fromMap(m);
   }
 
   // ── pairing
@@ -784,8 +841,27 @@ class Repo {
     'used': false,
   });
 
-  /// Returns the Guardian's name if the code is valid and unexpired, else null.
+  FirebaseFunctions get _fn =>
+      FirebaseFunctions.instanceFor(region: kFunctionsRegion);
+
+  /// Returns the Guardian's name if the code is valid, else null.
+  /// Goes through the `lookupCode` Cloud Function, which limits how fast codes can be guessed.
+  /// If the function is not deployed yet, falls back to a direct read (works with the
+  /// development rules only; the hardened rules block it on purpose).
   Future<String?> lookupCode(String code) async {
+    try {
+      final res = await _fn.httpsCallable('lookupCode').call({'code': code});
+      final data = Map<String, dynamic>.from(res.data as Map);
+      return data['guardianName'] as String?;
+    } on FirebaseFunctionsException catch (e) {
+      if (e.code == 'not-found') {
+        return _lookupDirect(code);
+      }
+      throw PairingException(e.message ?? 'Could not check that code.');
+    }
+  }
+
+  Future<String?> _lookupDirect(String code) async {
     final snap = await _db.collection('pairingCodes').doc(code).get();
     final d = snap.data();
     if (d == null || d['used'] == true) {
@@ -797,8 +873,33 @@ class Repo {
     return d['guardianName'] as String?;
   }
 
-  /// Traveler confirms: atomically burn the code and create the pair.
+  /// Traveler confirms: the `confirmPairing` Cloud Function burns the code and creates the pair.
   Future<void> confirmPairing(
+    String code, {
+    required String travelerName,
+    String travelerPhone = '',
+  }) async {
+    try {
+      await _fn.httpsCallable('confirmPairing').call({
+        'code': code,
+        'travelerName': travelerName,
+        'travelerPhone': travelerPhone,
+      });
+    } on FirebaseFunctionsException catch (e) {
+      if (e.code == 'not-found') {
+        return _confirmDirect(
+          code,
+          travelerName: travelerName,
+          travelerPhone: travelerPhone,
+        );
+      }
+      throw PairingException(e.message ?? 'Could not complete pairing.');
+    }
+  }
+
+  /// Development fallback (no Cloud Function). The pair id is "<guardianUid>_<travelerUid>",
+  /// the same id the function uses, so security rules can check a pair exists.
+  Future<void> _confirmDirect(
     String code, {
     required String travelerName,
     String travelerPhone = '',
@@ -808,12 +909,17 @@ class Repo {
       final snap = await tx.get(ref);
       final d = snap.data();
       if (d == null || d['used'] == true) {
-        throw Exception('Code already used');
+        throw PairingException(
+          'That code is invalid or has already been used.',
+        );
       }
       if ((d['expiresAt'] as int) < DateTime.now().millisecondsSinceEpoch) {
-        throw Exception('Code expired');
+        throw PairingException('That code has expired. Ask for a new one.');
       }
-      final pairRef = _db.collection('pairs').doc();
+      if (d['guardianUid'] == uid) {
+        throw PairingException('You cannot pair with yourself.');
+      }
+      final pairRef = _db.collection('pairs').doc('${d['guardianUid']}_$uid');
       tx.set(pairRef, {
         'guardianUid': d['guardianUid'],
         'guardianName': d['guardianName'],
@@ -824,7 +930,6 @@ class Repo {
         'sharingPaused': false,
         'createdAt': DateTime.now().millisecondsSinceEpoch,
       });
-      // Used by security rules: who may read this Traveler's data.
       tx.set(_db.collection('users').doc(uid), {
         'guardians': FieldValue.arrayUnion([d['guardianUid']]),
       }, SetOptions(merge: true));

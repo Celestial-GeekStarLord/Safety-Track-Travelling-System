@@ -22,6 +22,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'main.dart';
 import 'maps.dart';
+import 'notifications.dart';
 import 'services.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -516,6 +517,22 @@ Widget _tile(IconData i, {Color bg = SS.mint, Color fg = SS.teal}) => Container(
 );
 
 String _first(String n) => n.split(' ').first;
+
+/// Minutes since we last heard from a Traveler's phone (0 in demo mode).
+/// A phone that has died, lost signal or been battery-killed cannot say "I'm offline",
+/// so silence itself is the signal.
+int _quietMinutes(DeviceStatus? s, LocationPoint? p) {
+  if (GD.demo) {
+    return 0;
+  }
+  final heard = s?.lastSyncTs ?? p?.ts;
+  if (heard == null) {
+    return 0;
+  }
+  return ((DateTime.now().millisecondsSinceEpoch - heard) / 60000).round();
+}
+
+const int _quietThresholdMin = 20;
 String _initials(String n) =>
     n.split(' ').where((w) => w.isNotEmpty).map((w) => w[0]).take(2).join();
 
@@ -620,6 +637,31 @@ class _GuardianShellState extends State<GuardianShell> {
   int _tab = 0;
   final List<_Entry> _stack = [];
 
+  @override
+  void initState() {
+    super.initState();
+    NotifyBus.pendingAlert.addListener(_openPending);
+    AlertCenter.start(); // listens for new alerts + push taps while these screens are open
+    WidgetsBinding.instance.addPostFrameCallback((_) => _openPending());
+  }
+
+  @override
+  void dispose() {
+    NotifyBus.pendingAlert.removeListener(_openPending);
+    AlertCenter.stop();
+    super.dispose();
+  }
+
+  /// A banner or a push notification asked to open an alert.
+  void _openPending() {
+    final a = NotifyBus.pendingAlert.value;
+    if (a == null || !mounted) {
+      return;
+    }
+    NotifyBus.pendingAlert.value = null;
+    _push(AlertDetail(alert: a), tab: 2);
+  }
+
   void _goTab(int i) => setState(() {
     _stack.clear();
     _tab = i;
@@ -663,14 +705,16 @@ class _GuardianShellState extends State<GuardianShell> {
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) _pop();
       },
-      child: GShell(
-        nav: nav,
-        push: _push,
-        pop: _pop,
-        goTab: _goTab,
-        child: KeyedSubtree(
-          key: ValueKey('$_tab-${_stack.length}'),
-          child: body,
+      child: AlertBannerHost(
+        child: GShell(
+          nav: nav,
+          push: _push,
+          pop: _pop,
+          goTab: _goTab,
+          child: KeyedSubtree(
+            key: ValueKey('$_tab-${_stack.length}'),
+            child: body,
+          ),
         ),
       ),
     );
@@ -830,6 +874,8 @@ class _TravelerCard extends StatelessWidget {
       pair: pair,
       builder: (c, p, s) {
         final online = s?.online ?? true;
+        final quietMin = _quietMinutes(s, p);
+        final stale = quietMin >= _quietThresholdMin;
         final atZone = _zoneAt(pair, p, zones);
         final battery = (s?.battery ?? p?.battery ?? -1);
         final batteryTxt = battery < 0 ? '—' : '$battery%';
@@ -867,6 +913,12 @@ class _TravelerCard extends StatelessWidget {
                   ),
                   if (pair.sharingPaused)
                     const SSPill('Paused', bg: SS.amber, fg: SS.amberText)
+                  else if (stale)
+                    SSPill(
+                      'Quiet for ${fmtDuration(quietMin)}',
+                      bg: SS.amber,
+                      fg: SS.amberText,
+                    )
                   else
                     online
                         ? const SSPill('Live')
@@ -884,7 +936,7 @@ class _TravelerCard extends StatelessWidget {
                   mode: MapMode.fixed,
                   center: p == null ? null : ll(p),
                   initials: _initials(pair.travelerName),
-                  markerFaded: !online,
+                  markerFaded: !online || stale,
                   zones: zones
                       .where((z) => z.travelerUids.contains(pair.travelerUid))
                       .toList(),
@@ -997,6 +1049,8 @@ class TravelerDetail extends StatelessWidget {
       pair: pair,
       builder: (c, p, s) {
         final online = s?.online ?? true;
+        final quietMin = _quietMinutes(s, p);
+        final stale = quietMin >= _quietThresholdMin;
         final battery = s?.battery ?? p?.battery ?? -1;
         final acc = s?.gpsAccuracy ?? p?.accuracy ?? -1;
         final atZone = _zoneAt(pair, p, zones);
@@ -1013,13 +1067,19 @@ class TravelerDetail extends StatelessWidget {
             const SizedBox(height: 10),
             Row(
               children: [
-                online
-                    ? const SSPill('Live · just now')
-                    : const SSPill(
-                        'Offline · last known',
+                stale
+                    ? SSPill(
+                        'No update for ${fmtDuration(quietMin)}',
                         bg: SS.amber,
                         fg: SS.amberText,
-                      ),
+                      )
+                    : (online
+                          ? const SSPill('Live · just now')
+                          : const SSPill(
+                              'Offline · last known',
+                              bg: SS.amber,
+                              fg: SS.amberText,
+                            )),
                 const Spacer(),
                 Text(
                   p == null ? '' : fmtTime(p.ts),
@@ -2015,6 +2075,12 @@ class _AlertsScreenState extends State<AlertsScreen> {
                   title: 'Not everything needs an alert',
                   body:
                       'Home arrivals and familiar-zone stays are recorded quietly. Find them in History.',
+                ),
+                SSButton(
+                  'Alert settings',
+                  icon: Icons.tune,
+                  filled: false,
+                  onPressed: () => showAlertSettings(context),
                 ),
               ],
             );
